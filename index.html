@@ -58,21 +58,67 @@
       {minZoom:8,maxZoom:18,radiusKm:240}
     ];
     const MAX_ATTEMPTS=STAGES.length;
-    let cities=[],cityById=new Map(),aliasRows=[],map,answer,attempt=0,round=1,gameOver=false,marker=null;
+    let cities=[],cityById=new Map(),aliasRows=[],map,answer,attempt=0,round=1,gameOver=false,marker=null,allowedBounds=null;
     const $=id=>document.getElementById(id);
     const normalize=s=>(s||"").toString().normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^\p{Letter}\p{Number}\s]/gu," ").replace(/\s+/g," ").trim();
     const km=(a,b)=>{const R=6371,toRad=x=>x*Math.PI/180,dLat=toRad(b.lat-a.lat),dLng=toRad(b.lng-a.lng),lat1=toRad(a.lat),lat2=toRad(b.lat);const x=Math.sin(dLat/2)**2+Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLng/2)**2;return 2*R*Math.atan2(Math.sqrt(x),Math.sqrt(1-x))};
     const currentStage=()=>STAGES[Math.min(attempt,STAGES.length-1)];
     function boundsAround(city,radiusKm){const latDelta=radiusKm/111;const lngDelta=radiusKm/(111*Math.max(Math.cos(city.lat*Math.PI/180),0.2));return L.latLngBounds([city.lat-latDelta,city.lng-lngDelta],[city.lat+latDelta,city.lng+lngDelta]);}
+    function getLegalCenterPixelBounds(){
+      if(!allowedBounds)return null;
+      const z=map.getZoom();
+      const nw=map.project(allowedBounds.getNorthWest(),z);
+      const se=map.project(allowedBounds.getSouthEast(),z);
+      const half=map.getSize().divideBy(2);
+      const minX=nw.x+half.x;
+      const maxX=se.x-half.x;
+      const minY=nw.y+half.y;
+      const maxY=se.y-half.y;
+      return {minX,maxX,minY,maxY,nw,se};
+    }
+    function hasDragRoom(){
+      const b=getLegalCenterPixelBounds();
+      if(!b)return true;
+      return b.maxX-b.minX>4||b.maxY-b.minY>4;
+    }
+    function clampCenterToAllowed(animate=false){
+      if(gameOver||!allowedBounds)return;
+      const b=getLegalCenterPixelBounds();
+      if(!b)return;
+      const z=map.getZoom();
+      const p=map.project(map.getCenter(),z);
+      let x=p.x,y=p.y;
+      if(b.minX>b.maxX)x=(b.nw.x+b.se.x)/2;
+      else x=Math.min(Math.max(x,b.minX),b.maxX);
+      if(b.minY>b.maxY)y=(b.nw.y+b.se.y)/2;
+      else y=Math.min(Math.max(y,b.minY),b.maxY);
+      if(Math.abs(x-p.x)>0.5||Math.abs(y-p.y)>0.5){
+        map.setView(map.unproject([x,y],z),z,{animate});
+      }
+    }
+    function syncDragging(){
+      if(!map||!map.dragging)return;
+      if(gameOver||!allowedBounds){map.dragging.enable();return;}
+      const st=currentStage();
+      const z=map.getZoom();
+      if(z<=st.minZoom+0.01)map.dragging.disable();
+      else map.dragging.enable();
+    }
     function applyViewLimits(reason="keep"){
       const st=currentStage();
+      allowedBounds=null;
+      map.setMaxBounds(null);
       map.setMinZoom(st.minZoom);
       map.setMaxZoom(st.maxZoom);
-      map.setMaxBounds(null);
-      map.setView([answer.lat,answer.lng],st.minZoom,{animate:reason!=="start"});
-      const allowedBounds=map.getBounds();
-      map.setMaxBounds(allowedBounds);
-      map.options.maxBoundsViscosity=1.0;
+
+      // Important: do not animate here. If we record bounds during a zoom animation,
+      // Leaflet may give us the old viewport, which makes the next zoom level feel frozen.
+      map.setView([answer.lat,answer.lng],st.minZoom,{animate:false});
+
+      requestAnimationFrame(()=>{
+        allowedBounds=map.getBounds();
+        syncDragging();
+      });
     }
     const stats=()=>JSON.parse(localStorage.getItem("zcg_stats")||"{\"played\":0,\"won\":0}");
     const saveStats=s=>localStorage.setItem("zcg_stats",JSON.stringify(s));
@@ -83,13 +129,13 @@
     async function loadCities(){try{const r=await fetch("./cities.json",{cache:"no-store"});if(!r.ok)throw new Error("no cities.json");const data=await r.json();prepare(data);$("loadingText").textContent=`已加载 ${cities.length.toLocaleString()} 个城市。`;setTimeout(()=>$("loading").style.display="none",250);}catch(e){prepare(FALLBACK_CITIES);$("loadingText").textContent="没找到网站目录里的 cities.json，正在使用内置小题库。";setTimeout(()=>$("loading").style.display="none",700);}}
     function pool(){const d=$("difficulty").value;let p=cities;if(d==="easy")p=cities.filter(c=>c.population>=1000000||c.featureCode==="PPLC");if(d==="medium")p=cities.filter(c=>c.population>=100000&&c.population<3000000);if(d==="hard")p=cities.filter(c=>c.population>0&&c.population<300000);return p.length?p:cities;}
     function chooseCity(){const p=pool(),used=getUsed();let available=p.filter(c=>!used.has(c.id));if(!available.length){used.clear();saveUsed(used);available=p;}const weighted=[];for(const c of available){const w=c.featureCode==="PPLC"?4:c.population>=1000000?3:c.population>=100000?2:1;for(let i=0;i<w;i++)weighted.push(c);}return weighted[Math.floor(Math.random()*weighted.length)];}
-    function setupMap(){map=L.map("map",{zoomControl:true,dragging:true,scrollWheelZoom:true,doubleClickZoom:true,boxZoom:false,keyboard:true,tap:true,attributionControl:true,zoomSnap:1});L.tileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{maxZoom:19,attribution:"Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"}).addTo(map);}
+    function setupMap(){map=L.map("map",{zoomControl:true,dragging:true,scrollWheelZoom:true,doubleClickZoom:true,boxZoom:false,keyboard:true,tap:true,attributionControl:true,zoomSnap:1,inertia:false});L.tileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",{maxZoom:19,attribution:"Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community"}).addTo(map);map.on("drag",()=>clampCenterToAllowed(false));map.on("dragend",()=>clampCenterToAllowed(false));map.on("zoomend resize",()=>{clampCenterToAllowed(false);syncDragging();});}
     function startRound(){answer=chooseCity();attempt=0;gameOver=false;$("guessInput").value="";$("history").innerHTML="";$("result").style.display="none";$("guessBtn").disabled=false;if(marker){map.removeLayer(marker);marker=null;}applyViewLimits("start");$("roundPill").textContent=`Round ${round}`;$("countryPill").style.display=$("mode").value==="practice"?"block":"none";$("countryPill").textContent=`${answer.countryName||answer.countryCode}`;updateUI();}
     function updateUI(){$("attemptText").textContent=`${Math.min(attempt+1,MAX_ATTEMPTS)}/${MAX_ATTEMPTS}`;const st=currentStage();$("zoomText").textContent=`${st.minZoom}+`;const s=stats();$("playedText").textContent=s.played;$("winText").textContent=s.played?`${Math.round(s.won/s.played*100)}%`:"0%";$("hintText").textContent=gameOver?"":"";}
     function findExact(q){const n=normalize(q);if(!n)return null;let hit=aliasRows.find(r=>r.alias===n);if(hit)return hit.city;return null;}
     function suggest(q){const n=normalize(q);const box=$("suggestBox");box.innerHTML="";if(n.length<2){box.style.display="none";return;}const scored=[];const seen=new Set();for(const r of aliasRows){if(seen.has(r.city.id))continue;let score=0;if(r.alias.startsWith(n))score=3;else if(r.alias.includes(n))score=2;else continue;score+=Math.min(Math.log10((r.city.population||1)+1)/10,1);scored.push({score,city:r.city});seen.add(r.city.id);if(scored.length>350)break;}scored.sort((a,b)=>b.score-a.score).slice(0,12).forEach(({city})=>{const div=document.createElement("div");div.className="suggestion";div.innerHTML=`${city.name} <small>${city.countryName||city.countryCode} · ${Number(city.population||0).toLocaleString()}</small>`;div.onclick=()=>{$("guessInput").value=city.name;box.style.display="none";$("guessInput").focus();};box.appendChild(div);});box.style.display=box.children.length?"block":"none";}
     function addGuess(text,correct,dist){const div=document.createElement("div");div.className="guess";div.innerHTML=`<span>${text}</span><span class="tag ${correct?"ok":"bad"}">${correct?"正确":dist==null?"未收录":Math.round(dist).toLocaleString()+" km"}</span>`;$("history").prepend(div);}
-    function endRound(won){gameOver=true;$("guessBtn").disabled=true;const used=getUsed();used.add(answer.id);saveUsed(used);const s=stats();s.played++;if(won)s.won++;saveStats(s);map.setMinZoom(3);map.setMaxZoom(18);map.setMaxBounds(null);map.setView([answer.lat,answer.lng],11);marker=L.marker([answer.lat,answer.lng]).addTo(map).bindPopup(`${answer.name}${answer.countryName?", "+answer.countryName:""}`).openPopup();$("result").innerHTML=`<b>${won?"答对了":"没猜出来"}</b><br>答案：${answer.name}${answer.countryName?", "+answer.countryName:""}<br>人口：${Number(answer.population||0).toLocaleString()}<br><br><button id="continueBtn">继续下一题</button>`;$("result").style.display="block";$("continueBtn").onclick=()=>{round++;startRound();};updateUI();}
+    function endRound(won){gameOver=true;$("guessBtn").disabled=true;const used=getUsed();used.add(answer.id);saveUsed(used);const s=stats();s.played++;if(won)s.won++;saveStats(s);allowedBounds=null;map.dragging.enable();map.setMinZoom(3);map.setMaxZoom(18);map.setMaxBounds(null);map.setView([answer.lat,answer.lng],11);marker=L.marker([answer.lat,answer.lng]).addTo(map).bindPopup(`${answer.name}${answer.countryName?", "+answer.countryName:""}`).openPopup();$("result").innerHTML=`<b>${won?"答对了":"没猜出来"}</b><br>答案：${answer.name}${answer.countryName?", "+answer.countryName:""}<br>人口：${Number(answer.population||0).toLocaleString()}<br><br><button id="continueBtn">继续下一题</button>`;$("result").style.display="block";$("continueBtn").onclick=()=>{round++;startRound();};updateUI();}
     function submit(){if(gameOver)return;const raw=$("guessInput").value.trim();if(!raw)return;const guessed=findExact(raw);const correct=!!guessed&&guessed.id===answer.id;const dist=guessed?km(guessed,answer):null;addGuess(raw,correct,dist);if(correct){endRound(true);return;}attempt++;if(attempt>=MAX_ATTEMPTS){endRound(false);return;}applyViewLimits("wrong");$("guessInput").value="";$("suggestBox").style.display="none";updateUI();}
     $("guessBtn").onclick=submit;$("nextBtn").onclick=()=>{round++;startRound();};$("guessInput").addEventListener("keydown",e=>{if(e.key==="Enter")submit();if(e.key==="Escape")$("suggestBox").style.display="none";});$("guessInput").addEventListener("input",e=>suggest(e.target.value));$("difficulty").onchange=()=>{round=1;startRound();};$("mode").onchange=updateUI;$("resetBtn").onclick=()=>{localStorage.removeItem("zcg_stats");localStorage.removeItem(usedKey());updateUI();};document.addEventListener("click",e=>{if(!e.target.closest(".suggestions"))$("suggestBox").style.display="none";});
     (async()=>{setupMap();await loadCities();startRound();})();
